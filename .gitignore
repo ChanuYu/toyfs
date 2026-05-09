@@ -1,0 +1,35 @@
+**/.omc/
+
+# OMC / IDE
+.vscode/
+.idea/
+*.swp
+
+# Go build output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Coverage / profile
+coverage.out
+coverage.html
+*.prof
+
+# Go workspace
+go.work
+go.work.sum
+
+# Local binary output
+bin/
+
+# toyfs disk images
+*.img
+*.img.checkpoint
+disk.img
+testdata/*.img
+
+CLAUDE.md
