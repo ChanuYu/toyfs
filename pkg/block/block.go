@@ -111,21 +111,45 @@ func (c *CachedBlock) Put() {
 // caller는 이미 Get을 호출한 슬롯에 대해 호출.
 func (b *CachedBlock) MarkDirty() {
 	b.Dirty = true
-	b.DirtyAt = time.Time{}.Local()
+	b.DirtyAt = time.Now()
 }
 
 // Flush는 특정 슬롯을 본위치에 즉시 write한다. journal에 묶여 있으면 에러.
-func (c *BlockCache) Flush(b *CachedBlock) error
+func (c *BlockCache) Flush(b *CachedBlock) error {
+	err := c.Device.Write(b.BlockNum, b.Data)
+	if err != nil {
+		return err
+	}
+	return nil
+}
 
 // FlushAll은 dirty이고 evict 가능한 모든 슬롯을 본위치에 write한다.
-func (c *BlockCache) FlushAll() error
+func (c *BlockCache) FlushAll() error {
+	cur := c.LRUTail
+	for cur != nil {
+		if cur.Dirty && cur.RefCount == 0 && !cur.JournalLocked {
+			// dirty and evictable cached block
+			c.Flush(cur)
+		}
+		cur = cur.prev
+	}
+
+	return nil
+}
 
 // Sync는 디바이스 fsync 호출.
-func (c *BlockCache) Sync() error
+func (c *BlockCache) Sync() error {
+	c.Device.Sync()
+	return nil
+}
 
 // JournalLock/Unlock은 journal subsystem이 호출. commit 진행 중인 블록을 본위치 flush에서 제외한다.
-func (c *BlockCache) JournalLock(b *CachedBlock)
-func (c *BlockCache) JournalUnlock(b *CachedBlock)
+func (c *BlockCache) JournalLock(b *CachedBlock) {
+	b.JournalLocked = true
+}
+func (c *BlockCache) JournalUnlock(b *CachedBlock) {
+	b.JournalLocked = false
+}
 
 type CachedBlock struct {
 	BlockNum uint64
@@ -153,9 +177,29 @@ type BlockCache struct {
 	Device   *BlockDevice
 }
 
-func (d *BlockDevice) Read(blockNum uint64) ([4096]byte, error)
-func (d *BlockDevice) Write(blockNum uint64, data [4096]byte) error
-func (d *BlockDevice) Sync() error // os.File.Sync()
+func (d *BlockDevice) Read(blockNum uint64) ([4096]byte, error) {
+	//var buf [4096]byte
+	var buf [4096]byte
+	offset := int64(blockNum * uint64(d.BlockSize))
+	_, err := d.File.ReadAt(buf[:], offset)
+	if err != nil && err.Error() != "EOF" {
+		return buf, err
+	}
+
+	return buf, nil
+}
+func (d *BlockDevice) Write(blockNum uint64, data [4096]byte) error {
+	offset := int64(blockNum * uint64(d.BlockSize))
+	_, err := d.File.WriteAt(data[:], offset) // O_DIRECT 인 것으로 가정
+	if err != nil {
+		return err
+	}
+	return nil
+}
+func (d *BlockDevice) Sync() error {
+	// os.File.Sync()
+	return d.File.Sync()
+}
 
 type BlockDevice struct {
 	File      *os.File // Disk Image File handle
@@ -174,4 +218,7 @@ func (e IOMode) Error() string {
 	return "IOMode"
 }
 
-func (d *BlockDevice) ReadMode(blockNum uint64, mode IOMode) ([4096]byte, error)
+func (d *BlockDevice) ReadMode(blockNum uint64, mode IOMode) ([4096]byte, error) {
+	// future feature
+	return [4096]byte{}, nil
+}
