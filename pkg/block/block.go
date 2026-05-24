@@ -10,6 +10,7 @@ type BlockErr int
 const (
 	ENOMEM BlockErr = iota
 	EREAD
+	ENOENTRY
 )
 
 func (e BlockErr) Error() string {
@@ -22,13 +23,15 @@ func (c *BlockCache) Get(blockNum uint64) (*CachedBlock, error) {
 	cb, ok := c.Slots[blockNum]
 	if ok {
 		cb.RefCount++
-		//move LRU
-		if cb == c.LRUTail {
-			cb.prev.next = cb.next
-			c.LRUTail = cb.prev
-		} else if cb != c.LRUHead {
-			cb.prev.next = cb.next
-			cb.next.prev = cb.prev
+		//move LRU (except the case of LRUHead)
+		if cb != c.LRUHead {
+			if cb == c.LRUTail {
+				cb.prev.next = cb.next
+				c.LRUTail = cb.prev
+			} else {
+				cb.prev.next = cb.next
+				cb.next.prev = cb.prev
+			}
 		}
 
 		if cb != c.LRUHead {
@@ -37,18 +40,17 @@ func (c *BlockCache) Get(blockNum uint64) (*CachedBlock, error) {
 			c.LRUHead.prev = cb
 			c.LRUHead = cb
 		}
-
 		return cb, nil
 	} // end of cache hit
 
 	// cache miss
 	if c.Used == c.Capacity {
 		// evict tail node
-		err := evict_one(c.LRUTail, &c.Used, c.Device)
+		blk_n, err := evict_one(c.LRUTail, &c.Used, c.Device)
 		if err == ENOMEM {
 			return nil, err
 		}
-		delete(c.Slots, blockNum)
+		delete(c.Slots, blk_n)
 		c.Used--
 	}
 
@@ -68,22 +70,27 @@ func (c *BlockCache) Get(blockNum uint64) (*CachedBlock, error) {
 	c.Slots[blockNum] = new_cb
 
 	// insert to HEAD of LRU
-	new_cb.prev = nil
-	new_cb.next = c.LRUHead
-	c.LRUHead.prev = new_cb
-	c.LRUHead = new_cb
+	if c.LRUHead == nil {
+		c.LRUHead, c.LRUTail = new_cb, new_cb
+		new_cb.prev, new_cb.next = nil, nil
+	} else {
+		new_cb.prev = nil
+		new_cb.next = c.LRUHead
+		c.LRUHead.prev = new_cb
+		c.LRUHead = new_cb
+	}
 
-	return cb, nil
+	return new_cb, nil
 }
 
-func evict_one(tail *CachedBlock, used *int, dev *BlockDevice) error {
+func evict_one(tail *CachedBlock, used *int, dev *BlockDevice) (uint64, error) {
 	var cur = tail
 	for cur != nil {
 		if cur.RefCount > 0 || cur.JournalLocked {
 			cur = cur.prev
 			continue
 		}
-
+		// Success to get a victim node
 		if cur.Dirty {
 			dev.Write(cur.BlockNum, cur.Data)
 		}
@@ -97,9 +104,10 @@ func evict_one(tail *CachedBlock, used *int, dev *BlockDevice) error {
 		}
 
 		(*used)--
+		return cur.BlockNum, nil
 	}
 
-	return ENOMEM
+	return uint64(ENOENTRY), ENOMEM
 }
 
 // Put은 RefCount를 감소시킨다. 0이 되면 eviction 후보로 들어갈 수 있다.
