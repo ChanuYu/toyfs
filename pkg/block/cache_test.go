@@ -1,23 +1,188 @@
 package block
 
-import "testing"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // Skeleton tests derived from docs/06-block-cache.md §10.1.
 // All tests start as t.Skip(...) so the suite stays green; flesh out as the
 // implementation lands.
 
+// ---- test helpers ----
+
+// newTestCache builds an empty BlockCache backed by an empty disk image of
+// numBlocks * 4 KiB sitting in a t.TempDir(). The image and any open file
+// handle are cleaned up automatically when the test ends.
+func newTestCache(t *testing.T, capacity, numBlocks int) *BlockCache {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "disk.img")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create disk image: %v", err)
+	}
+	t.Cleanup(func() { f.Close() })
+
+	// Pre-size the file so ReadAt on any valid block returns zeros instead of
+	// a short read.
+	if err := f.Truncate(int64(numBlocks) * 4096); err != nil {
+		t.Fatalf("truncate disk image: %v", err)
+	}
+
+	return &BlockCache{
+		Slots:    make(map[uint64]*CachedBlock),
+		Capacity: capacity,
+		Device: &BlockDevice{
+			File:      f,
+			BlockSize: 4096,
+			NumBlocks: uint64(numBlocks),
+		},
+	}
+}
+
 // ---- basic Get/Put / LRU ----
 
-func TestGetCacheHit(t *testing.T)      { t.Skip("06 §10.1 — cache hit path") }
-func TestGetCacheMiss(t *testing.T)     { t.Skip("06 §10.1 — cache miss loads from device") }
-func TestPutLeakDetection(t *testing.T) { t.Skip("06 §10.1 — Get without Put keeps refcount > 0") }
+func TestGetCacheHit(t *testing.T) {
+	c := newTestCache(t, 256, 16)
+	// First Get: cache miss → slot is loaded from the device. RefCount == 1.
+	fmt.Printf("First Access\n")
+	first, err := c.Get(42)
+	if err != nil {
+		t.Fatalf("first Get(42) returned error: %v", err)
+	}
+	if first == nil {
+		t.Fatal("first Get(42) returned a nil slot")
+	}
+	if first.BlockNum != 42 {
+		t.Errorf("first.BlockNum = %d, want 42", first.BlockNum)
+	}
+	if first.RefCount != 1 {
+		t.Errorf("after first Get: RefCount = %d, want 1", first.RefCount)
+	}
+
+	// Second Get on the same block: cache hit. We must get the *exact same*
+	// slot pointer back (no realloc) and RefCount must bump to 2.
+	fmt.Printf("Second Access\n")
+	second, err := c.Get(42)
+	if err != nil {
+		t.Fatalf("second Get(42) returned error: %v", err)
+	}
+	if second != first {
+		t.Errorf("second Get(42) returned a different slot pointer (got %p, want %p)", second, first)
+	}
+	if second.RefCount != 2 {
+		t.Errorf("after second Get: RefCount = %d, want 2", second.RefCount)
+	}
+
+	// The cache must still track exactly one slot — the hit must not have
+	// allocated anything new.
+	if got := len(c.Slots); got != 1 {
+		t.Errorf("len(c.Slots) = %d, want 1", got)
+	}
+}
+
+func TestGetCacheMiss(t *testing.T) {
+	c := newTestCache(t, 256, 16)
+
+	blk, err := c.Get(55)
+	if err != nil {
+		t.Fatalf("Get failed to allocate new CachedBlock\n")
+	}
+	if blk.BlockNum != 55 {
+		t.Fatalf("CachedBlock has inappropriate block num %d\n", blk.BlockNum)
+	}
+	if blk.RefCount != 1 {
+		t.Errorf("Reference count should be 1\n")
+	}
+
+	if got := len(c.Slots); got != 1 {
+		t.Errorf("len(c.Slots) = %d, want 1\n", got)
+	}
+}
+func TestPutLeakDetection(t *testing.T) {
+	c := newTestCache(t, 256, 16)
+	blk, _ := c.Get(30)
+	if blk.RefCount != 1 {
+		t.Errorf("Refcount should be 1")
+	}
+	blk.Put()
+	if blk.RefCount > 0 {
+		t.Errorf("Refcount should be 0 after Put()")
+	}
+}
 func TestEvictOnFullCacheChoosesLRUTail(t *testing.T) {
-	t.Skip("06 §10.1 — 256 slots full → tail evicted")
+	c := newTestCache(t, 256, 256)
+	for blk := 1; blk <= 256; blk++ {
+		cachedBlk, _ := c.Get(uint64(blk))
+		cachedBlk.Put() // make reference count of the cached block 0
+	}
+	if got := len(c.Slots); got != 256 {
+		t.Fatalf("Cache size should be 256")
+	}
+	tail := c.LRUTail
+	if tail.BlockNum != 1 {
+		t.Errorf("Block number of tail should be %d, not %d", 1, tail.BlockNum)
+	}
+	fmt.Printf("Test: Get triggers eviction\n")
+	c.Get(1000) // tail should be evicted
+	if got := len(c.Slots); got != 256 {
+		t.Fatalf("Cache size should be kept after eviction")
+	}
+	newTail := c.LRUTail
+	if tail == newTail {
+		t.Fatalf("Eviction does not happened")
+	}
+	if newTail.BlockNum != 2 {
+		t.Errorf("newTail should be %d, not %d", 2, newTail.BlockNum)
+	}
+
 }
 func TestEvictNoCandidateReturnsENOMEM(t *testing.T) {
-	t.Skip("06 §10.1 — every slot pinned → ENOMEM")
+	c := newTestCache(t, 256, 256)
+	for blk := 1; blk <= 256; blk++ {
+		c.Get(uint64(blk))
+		// skip Put() to remain all the cached blocks not evictable
+	}
+
+	if got := len(c.Slots); got != 256 {
+		t.Fatalf("Cache size should be 256")
+	}
+
+	_, err := c.Get(uint64(1000))
+	if err != ENOMEM {
+		t.Errorf("Get must return ENOMEM")
+	}
+
+	if c.LRUHead.BlockNum == 1000 {
+		t.Fatalf("The last block should not be allocated to the cache")
+	}
 }
-func TestGetMovesSlotToLRUHead(t *testing.T) { t.Skip("06 §10.1 — recency update") }
+func TestGetMovesSlotToLRUHead(t *testing.T) {
+	c := newTestCache(t, 256, 256)
+	testcase := []struct {
+		name  string
+		input uint64
+	}{
+		{"init", 10},
+		{"init", 20},
+		{"init", 30},
+		{"init", 40},
+		{"init", 50},
+		{"reaccess", 30},
+		{"reaccess", 10},
+	}
+	for _, tc := range testcase {
+		t.Run(tc.name, func(t *testing.T) {
+			blk, _ := c.Get(tc.input)
+			if blk != c.LRUHead || blk.BlockNum != tc.input {
+				t.Errorf("%s: last accessed block %d should be located on LRUHead", tc.name, tc.input)
+			}
+		})
+	}
+}
 
 // ---- dirty / flush ----
 
