@@ -46,7 +46,7 @@ func (c *BlockCache) Get(blockNum uint64) (*CachedBlock, error) {
 	// cache miss
 	if c.Used == c.Capacity {
 		// evict tail node
-		blk_n, err := evict_one(c.LRUTail, &c.Used, c.Device)
+		blk_n, err := evict_one(&c.LRUHead, &c.LRUTail, c.Device)
 		if err == ENOMEM {
 			return nil, err
 		}
@@ -83,8 +83,8 @@ func (c *BlockCache) Get(blockNum uint64) (*CachedBlock, error) {
 	return new_cb, nil
 }
 
-func evict_one(tail *CachedBlock, used *int, dev *BlockDevice) (uint64, error) {
-	var cur = tail
+func evict_one(head **CachedBlock, tail **CachedBlock, dev *BlockDevice) (uint64, error) {
+	var cur = *tail
 	for cur != nil {
 		if cur.RefCount > 0 || cur.JournalLocked {
 			cur = cur.prev
@@ -95,15 +95,22 @@ func evict_one(tail *CachedBlock, used *int, dev *BlockDevice) (uint64, error) {
 			dev.Write(cur.BlockNum, cur.Data)
 		}
 
-		//Remove cur from LRU
 		if cur.prev != nil {
 			cur.prev.next = cur.next
-		}
-		if cur.next != nil {
-			cur.next.prev = cur.prev
+		} else {
+			// cur is on LRUHead
+			*head = cur.next
 		}
 
-		(*used)--
+		if cur.next != nil {
+			cur.next.prev = cur.prev
+		} else {
+			// cur is on LRUTail
+			*tail = cur.prev
+		}
+
+		cur.prev, cur.next = nil, nil
+
 		return cur.BlockNum, nil
 	}
 
