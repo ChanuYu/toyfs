@@ -1,6 +1,7 @@
 package block
 
 import (
+	"fmt"
 	"os"
 	"time"
 )
@@ -64,7 +65,7 @@ func (c *BlockCache) Get(blockNum uint64) (*CachedBlock, error) {
 		BlockNum:      blockNum,
 		Dirty:         false,
 		RefCount:      1,
-		Data:          r_data,
+		Data:          *r_data,
 		JournalLocked: false,
 	}
 	c.Slots[blockNum] = new_cb
@@ -92,7 +93,7 @@ func evict_one(head **CachedBlock, tail **CachedBlock, dev *BlockDevice) (uint64
 		}
 		// Success to get a victim node
 		if cur.Dirty {
-			dev.Write(cur.BlockNum, cur.Data)
+			dev.Write(cur.BlockNum, &cur.Data)
 		}
 
 		if cur.prev != nil {
@@ -129,9 +130,18 @@ func (b *CachedBlock) MarkDirty() {
 	b.DirtyAt = time.Now()
 }
 
+func (b *CachedBlock) WriteData(data *[4096]byte) {
+	copy(b.Data[:], (*data)[:])
+	b.MarkDirty()
+}
+
+func (b *CachedBlock) ReadData() *[4096]byte {
+	return &b.Data
+}
+
 // Flush는 특정 슬롯을 본위치에 즉시 write한다. journal에 묶여 있으면 에러.
 func (c *BlockCache) Flush(b *CachedBlock) error {
-	err := c.Device.Write(b.BlockNum, b.Data)
+	err := c.Device.Write(b.BlockNum, &b.Data)
 	if err != nil {
 		return err
 	}
@@ -192,21 +202,22 @@ type BlockCache struct {
 	Device   *BlockDevice
 }
 
-func (d *BlockDevice) Read(blockNum uint64) ([4096]byte, error) {
+func (d *BlockDevice) Read(blockNum uint64) (*[4096]byte, error) {
 	//var buf [4096]byte
 	var buf [4096]byte
 	offset := int64(blockNum * uint64(d.BlockSize))
 	_, err := d.File.ReadAt(buf[:], offset)
 	if err != nil && err.Error() != "EOF" {
-		return buf, err
+		return &buf, err
 	}
 
-	return buf, nil
+	return &buf, nil
 }
-func (d *BlockDevice) Write(blockNum uint64, data [4096]byte) error {
+func (d *BlockDevice) Write(blockNum uint64, data *[4096]byte) error {
 	offset := int64(blockNum * uint64(d.BlockSize))
-	_, err := d.File.WriteAt(data[:], offset) // O_DIRECT 인 것으로 가정
+	_, err := d.File.WriteAt((*data)[:], offset) // O_DIRECT 인 것으로 가정
 	if err != nil {
+		fmt.Printf("Err - BlockDevice: %s", err)
 		return err
 	}
 	return nil
