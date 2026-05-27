@@ -2,8 +2,10 @@ package block
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -187,23 +189,210 @@ func TestGetMovesSlotToLRUHead(t *testing.T) {
 // ---- dirty / flush ----
 
 func TestMarkDirtyEvictionWritesBack(t *testing.T) {
-	t.Skip("06 §10.1 — dirty evict writes home location")
+	c := newTestCache(t, 128, 256)
+	var str = "Newly Written Data"
+	for i := 1; i <= 128; i++ {
+		blk, _ := c.Get(uint64(i))
+		if i == 1 {
+			// Write New Data
+			var data [4096]byte
+			copy(data[:], str)
+			blk.WriteData(&data)
+		}
+		blk.Put()
+	}
+
+	// trigger last data eviction
+	c.Get(200)
+
+	readData, err := c.Device.Read(1)
+	if err != nil {
+		t.Errorf("Device.Read Failed: %s\n", err)
+	}
+	if string((*readData)[:len(str)]) != str {
+		t.Errorf("Incorrect Data: *readData - %q, org - %s\n", *readData, str)
+	}
 }
 func TestFlushAllClearsDirty(t *testing.T) {
-	t.Skip("06 §10.1 — FlushAll → no dirty slots remain")
+	// make dirty data set
+	dirtySet := make([]int, 10)
+	for i := range 10 {
+		dirtySet[i] = rand.Intn(128) + 1
+	}
+	str := "Dirty Data"
+	data := [4096]byte{}
+	copy(data[:], str)
+
+	// Make CachedBlock dirty if blockNumber is in the dirtyset
+	c := newTestCache(t, 128, 256)
+	for i := 1; i <= 128; i++ {
+		blk, _ := c.Get(uint64(i))
+		if slices.Contains(dirtySet, i) {
+			blk.WriteData(&data)
+		}
+		blk.Put()
+	}
+
+	// Flush all the dirty cache
+	c.FlushAll()
+
+	// Check if there's dirty data exists
+	for i := 1; i <= 128; i++ {
+		blk, _ := c.Get(uint64(i))
+		if blk.Dirty {
+			t.Errorf("Block %d still marked dirty\n", blk.BlockNum)
+		}
+	}
+
+	// Check whether all the data written to disk is correct
+	for _, i := range dirtySet {
+		blk, _ := c.Get(uint64(i))
+		if string((*blk.ReadData())[:len(str)]) != str {
+			t.Errorf("%d Block Data: %q\n", i, *blk.ReadData())
+		}
+	}
 }
-func TestSyncCallsDeviceFsync(t *testing.T) { t.Skip("06 §10.1 — Sync forwards to device") }
+func TestSyncCallsDeviceFsync(t *testing.T) {
+	// make dirty data set
+	dirtySet := make([]int, 10)
+	for i := range 10 {
+		dirtySet[i] = rand.Intn(128) + 1
+	}
+	str := "Dirty Data"
+	data := [4096]byte{}
+	copy(data[:], str)
+
+	// Make CachedBlock dirty if blockNumber is in the dirtyset
+	c := newTestCache(t, 128, 256)
+	for i := 1; i <= 128; i++ {
+		blk, _ := c.Get(uint64(i))
+		if slices.Contains(dirtySet, i) {
+			blk.WriteData(&data)
+		}
+		blk.Put()
+	}
+
+	// Flush all the dirty cache
+	c.Sync()
+
+	// Check if there's dirty data exists
+	for i := 1; i <= 128; i++ {
+		blk, _ := c.Get(uint64(i))
+		if blk.Dirty {
+			t.Errorf("Block %d still marked dirty\n", blk.BlockNum)
+		}
+	}
+
+	// Check whether all the data written to disk is correct
+	for _, i := range dirtySet {
+		blk, _ := c.Get(uint64(i))
+		if string((*blk.ReadData())[:len(str)]) != str {
+			t.Errorf("%d Block Data: %q\n", i, *blk.ReadData())
+		}
+	}
+}
 
 // ---- journal pinning ----
 
 func TestJournalLockedSlotIsSkippedByEvict(t *testing.T) {
-	t.Skip("06 §10.1 — pin keeps slot resident")
+	//t.Skip("06 §10.1 — pin keeps slot resident")
+	pinnedSet := make([]int, 10)
+	for i := range pinnedSet {
+		pinnedSet[i] = rand.Intn(128)
+	}
+
+	c := newTestCache(t, 128, 256)
+	for i := range 128 {
+		blk, _ := c.Get(uint64(i))
+		if slices.Contains(pinnedSet, i) {
+			blk.JournalLocked = true
+		}
+		blk.Put()
+	}
 }
 func TestAllSlotsJournalLockedReturnsENOMEM(t *testing.T) {
-	t.Skip("06 §10.1 — every slot pinned by journal")
+	c := newTestCache(t, 128, 256)
+	for i := 0; i < 128; i++ {
+		blk, _ := c.Get(uint64(i))
+		blk.JournalLocked = true
+		blk.Put()
+	}
+
+	if got := len(c.Slots); got != 128 {
+		t.Fatalf("Cache size should be 128")
+	}
+
+	_, err := c.Get(uint64(255))
+	if err != ENOMEM {
+		t.Errorf("Get must return ENOMEM")
+	}
+
+	if c.LRUHead.BlockNum == 255 {
+		t.Fatalf("The last block should not be allocated to the cache")
+	}
 }
 func TestJournalUnlockReenablesEviction(t *testing.T) {
-	t.Skip("06 §10.1 — unlock makes slot evictable")
+	journalSet := make([]int, 10)
+	for i := range 10 {
+		journalSet[i] = rand.Intn(128)
+	}
+
+	// make journalSet slice have unique elements
+	journalSet = func(nums []int) []int {
+		set := make(map[int]struct{})
+		res := make([]int, 0, len(nums))
+
+		for _, i := range nums {
+			if _, ok := set[i]; ok {
+				continue
+			}
+			set[i] = struct{}{}
+			res = append(res, i)
+		}
+		return res
+	}(journalSet)
+
+	c := newTestCache(t, 128, 256)
+	for i := 0; i < 128; i++ {
+		blk, _ := c.Get(uint64(i))
+		// make the element of journal set JournalLocked, and the others keep referenced, so that no one in the cached evictable
+		if slices.Contains(journalSet, i) {
+			blk.JournalLocked = true
+			blk.Put()
+		}
+	}
+
+	if got := len(c.Slots); got != 128 {
+		t.Fatalf("Cache size should be 128")
+	}
+
+	_, err := c.Get(uint64(255))
+	if err != ENOMEM {
+		t.Errorf("Get must return ENOMEM")
+	}
+
+	for _, i := range journalSet {
+		blk, _ := c.Get(uint64(i))
+		blk.JournalLocked = false
+		blk.Put()
+	}
+
+	// new accesses for the size of journalSet
+	for i := range len(journalSet) {
+		_, err := c.Get(uint64(i + 128))
+		if err == ENOMEM {
+			t.Errorf("%d block failed to get cache entry\n", i+128)
+		}
+	}
+
+	// check if there's any journalSet element
+	cur := c.LRUHead
+	for cur != nil {
+		if slices.Contains(journalSet, int(cur.BlockNum)) {
+			t.Errorf("journalSet element %d exist on cache\n", cur.BlockNum)
+		}
+		cur = cur.next
+	}
 }
 
 // ---- frozen copy ----
