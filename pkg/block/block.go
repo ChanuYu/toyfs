@@ -93,7 +93,10 @@ func evict_one(head **CachedBlock, tail **CachedBlock, dev *BlockDevice) (uint64
 		}
 		// Success to get a victim node
 		if cur.Dirty {
-			dev.Write(cur.BlockNum, &cur.Data)
+			err := dev.Write(cur.BlockNum, &cur.Data)
+			if err != nil {
+				cur.Dirty = false
+			}
 		}
 
 		if cur.prev != nil {
@@ -145,6 +148,7 @@ func (c *BlockCache) Flush(b *CachedBlock) error {
 	if err != nil {
 		return err
 	}
+	b.Dirty = false
 	return nil
 }
 
@@ -164,7 +168,17 @@ func (c *BlockCache) FlushAll() error {
 
 // Sync는 디바이스 fsync 호출.
 func (c *BlockCache) Sync() error {
-	c.Device.Sync()
+	err := c.Device.Sync()
+	if err != nil {
+		fmt.Printf("BlockCache: Failed to Sync()\n")
+		return err
+	}
+	// Mark clean for all the dirty data
+	cur := c.LRUHead
+	for cur != nil {
+		cur.Dirty = false // just mark clean
+		cur = cur.next
+	}
 	return nil
 }
 
@@ -223,7 +237,6 @@ func (d *BlockDevice) Write(blockNum uint64, data *[4096]byte) error {
 	return nil
 }
 func (d *BlockDevice) Sync() error {
-	// os.File.Sync()
 	return d.File.Sync()
 }
 
