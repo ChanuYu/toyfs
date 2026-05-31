@@ -338,19 +338,7 @@ func TestJournalUnlockReenablesEviction(t *testing.T) {
 	}
 
 	// make journalSet slice have unique elements
-	journalSet = func(nums []int) []int {
-		set := make(map[int]struct{})
-		res := make([]int, 0, len(nums))
-
-		for _, i := range nums {
-			if _, ok := set[i]; ok {
-				continue
-			}
-			set[i] = struct{}{}
-			res = append(res, i)
-		}
-		return res
-	}(journalSet)
+	journalSet = makeUniqueSet(journalSet)
 
 	c := newTestCache(t, 128, 256)
 	for i := 0; i < 128; i++ {
@@ -395,23 +383,118 @@ func TestJournalUnlockReenablesEviction(t *testing.T) {
 	}
 }
 
+func makeUniqueSet(nums []int) []int {
+	set := make(map[int]struct{})
+	res := make([]int, 0, 10)
+
+	for _, num := range nums {
+		if _, ok := set[num]; ok {
+			continue
+		}
+		set[num] = struct{}{}
+		res = append(res, num)
+	}
+
+	return res
+}
+
 // ---- frozen copy ----
 
 func TestFreezeForCommitSnapshotsData(t *testing.T) {
-	t.Skip("06 §10.1 — frozen retains pre-commit bytes")
+	frozenSet := make([]int, 10)
+	frozenSet = makeUniqueSet(frozenSet)
+
+	iniStr := "Initialized Data"
+	upStr := "Updated Data"
+	var iniData [4096]byte
+	var upData [4096]byte
+	copy(iniData[:], iniStr)
+	copy(upData[:], upStr)
+
+	c := newTestCache(t, 128, 256)
+	for i := range 128 {
+		blk, _ := c.Get(uint64(i))
+		if slices.Contains(frozenSet, int(blk.BlockNum)) {
+			blk.WriteData(&iniData)
+			c.FreezeForCommit(blk)
+			blk.WriteData(&upData)
+			if string((*blk.FrozenData)[:len(iniStr)]) != iniStr {
+				t.Errorf("Block %d does not have iniStr. It has %s\n", blk.BlockNum, blk.Data)
+			}
+		}
+		blk.Put()
+	}
 }
 func TestReleaseFrozenClearsCopy(t *testing.T) {
-	t.Skip("06 §10.1 — FrozenData == nil after release")
+	frozenSet := make([]int, 10)
+	frozenSet = makeUniqueSet(frozenSet)
+
+	iniStr := "Initialized Data"
+	var iniData [4096]byte
+	copy(iniData[:], iniStr)
+
+	c := newTestCache(t, 128, 256)
+	for i := range 128 {
+		blk, _ := c.Get(uint64(i))
+		if slices.Contains(frozenSet, int(blk.BlockNum)) {
+			blk.WriteData(&iniData)
+			if blk.FrozenData != nil {
+				t.Errorf("Block %d FrozenData is not nil\n", blk.BlockNum)
+			}
+			c.FreezeForCommit(blk)
+			if blk.FrozenData == nil {
+				t.Errorf("Block %d FrozenData is nil after Freeze\n", blk.BlockNum)
+			}
+			c.ReleaseFrozen(blk)
+			if blk.FrozenData != nil {
+				t.Errorf("Block %d FrozenData is not nil after Release\n", blk.BlockNum)
+			}
+		}
+		blk.Put()
+	}
 }
 
 // ---- ordering invariant ----
 
 func TestFlushOnJournalLockedReturnsError(t *testing.T) {
-	t.Skip("06 §10.1 — explicit Flush on pinned slot fails")
+	journalSet := make([]int, 10)
+	journalSet = makeUniqueSet(journalSet)
+
+	iniStr := "Initialized Data"
+	var iniData [4096]byte
+	copy(iniData[:], iniStr)
+
+	c := newTestCache(t, 128, 256)
+	for _, i := range journalSet {
+		blk, _ := c.Get(uint64(i))
+		c.JournalLock(blk)
+		got := c.Flush(blk)
+		if got != EJOURNALLOCKED {
+			t.Errorf("Block %d should not be flushed\n", blk.BlockNum)
+		}
+		blk.Put()
+	}
 }
 
 // ---- stress / leak ----
 
 func TestStressGetPutMarkDirtyNoLeak(t *testing.T) {
-	t.Skip("06 §10.4 — 100k random ops, all RefCount==0 at end")
+	str := "random string"
+	var data [4096]byte
+	copy(data[:], str)
+
+	c := newTestCache(t, 128, 256)
+	for i := range 100000 {
+		blk, _ := c.Get(uint64(i % 256))
+		blk.WriteData(&data)
+		blk.Put()
+	}
+
+	cur := c.LRUHead
+	for cur != nil {
+		if cur.RefCount > 0 {
+			t.Errorf("Block %d's refcount > 0\n", cur.BlockNum)
+		}
+		cur = cur.next
+	}
 }
