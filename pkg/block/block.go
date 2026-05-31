@@ -12,6 +12,7 @@ const (
 	ENOMEM BlockErr = iota
 	EREAD
 	ENOENTRY
+	EJOURNALLOCKED
 )
 
 func (e BlockErr) Error() string {
@@ -144,6 +145,9 @@ func (b *CachedBlock) ReadData() *[4096]byte {
 
 // Flush는 특정 슬롯을 본위치에 즉시 write한다. journal에 묶여 있으면 에러.
 func (c *BlockCache) Flush(b *CachedBlock) error {
+	if b.JournalLocked {
+		return EJOURNALLOCKED
+	}
 	err := c.Device.Write(b.BlockNum, &b.Data)
 	if err != nil {
 		return err
@@ -188,6 +192,18 @@ func (c *BlockCache) JournalLock(b *CachedBlock) {
 }
 func (c *BlockCache) JournalUnlock(b *CachedBlock) {
 	b.JournalLocked = false
+}
+
+func (c *BlockCache) FreezeForCommit(b *CachedBlock) {
+	if b.FrozenData != nil {
+		fmt.Printf("Double freeze happened on block %d\n", b.BlockNum)
+	}
+	frozen := b.Data
+	b.FrozenData = &frozen
+}
+
+func (c *BlockCache) ReleaseFrozen(b *CachedBlock) {
+	b.FrozenData = nil
 }
 
 type CachedBlock struct {
