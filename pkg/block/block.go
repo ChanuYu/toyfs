@@ -1,9 +1,210 @@
 package block
 
 import (
+	"fmt"
 	"os"
 	"time"
 )
+
+type BlockErr int
+
+const (
+	ENOMEM BlockErr = iota
+	EREAD
+	ENOENTRY
+	EJOURNALLOCKED
+)
+
+func (e BlockErr) Error() string {
+	return "BlockErr"
+}
+
+// Get은 slot의 RefCount를 증가시키고 반환한다. 캐시에 없으면 디스크에서 로드.
+// 호출자는 사용 후 반드시 Put을 호출해야 한다.
+func (c *BlockCache) Get(blockNum uint64) (*CachedBlock, error) {
+	cb, ok := c.Slots[blockNum]
+	if ok {
+		cb.RefCount++
+		//move LRU (except the case of LRUHead)
+		if cb != c.LRUHead {
+			if cb == c.LRUTail {
+				cb.prev.next = cb.next
+				c.LRUTail = cb.prev
+			} else {
+				cb.prev.next = cb.next
+				cb.next.prev = cb.prev
+			}
+		}
+
+		if cb != c.LRUHead {
+			cb.prev = nil
+			cb.next = c.LRUHead
+			c.LRUHead.prev = cb
+			c.LRUHead = cb
+		}
+		return cb, nil
+	} // end of cache hit
+
+	// cache miss
+	if c.Used == c.Capacity {
+		// evict tail node
+		blk_n, err := evict_one(&c.LRUHead, &c.LRUTail, c.Device)
+		if err == ENOMEM {
+			return nil, err
+		}
+		delete(c.Slots, blk_n)
+		c.Used--
+	}
+
+	// alloc new cached block
+	c.Used++
+	r_data, err := c.Device.Read(blockNum)
+	if err != nil {
+		return nil, EREAD
+	}
+	new_cb := &CachedBlock{
+		BlockNum:      blockNum,
+		Dirty:         false,
+		RefCount:      1,
+		Data:          *r_data,
+		JournalLocked: false,
+	}
+	c.Slots[blockNum] = new_cb
+
+	// insert to HEAD of LRU
+	if c.LRUHead == nil {
+		c.LRUHead, c.LRUTail = new_cb, new_cb
+		new_cb.prev, new_cb.next = nil, nil
+	} else {
+		new_cb.prev = nil
+		new_cb.next = c.LRUHead
+		c.LRUHead.prev = new_cb
+		c.LRUHead = new_cb
+	}
+
+	return new_cb, nil
+}
+
+func evict_one(head **CachedBlock, tail **CachedBlock, dev *BlockDevice) (uint64, error) {
+	var cur = *tail
+	for cur != nil {
+		if cur.RefCount > 0 || cur.JournalLocked {
+			cur = cur.prev
+			continue
+		}
+		// Success to get a victim node
+		if cur.Dirty {
+			err := dev.Write(cur.BlockNum, &cur.Data)
+			if err != nil {
+				cur.Dirty = false
+			}
+		}
+
+		if cur.prev != nil {
+			cur.prev.next = cur.next
+		} else {
+			// cur is on LRUHead
+			*head = cur.next
+		}
+
+		if cur.next != nil {
+			cur.next.prev = cur.prev
+		} else {
+			// cur is on LRUTail
+			*tail = cur.prev
+		}
+
+		cur.prev, cur.next = nil, nil
+
+		return cur.BlockNum, nil
+	}
+
+	return uint64(ENOENTRY), ENOMEM
+}
+
+// Put은 RefCount를 감소시킨다. 0이 되면 eviction 후보로 들어갈 수 있다.
+func (c *CachedBlock) Put() {
+	c.RefCount--
+}
+
+// MarkDirty는 슬롯을 dirty로 마킹하고 DirtyAt을 갱신한다.
+// caller는 이미 Get을 호출한 슬롯에 대해 호출.
+func (b *CachedBlock) MarkDirty() {
+	b.Dirty = true
+	b.DirtyAt = time.Now()
+}
+
+func (b *CachedBlock) WriteData(data *[4096]byte) {
+	copy(b.Data[:], (*data)[:])
+	b.MarkDirty()
+}
+
+func (b *CachedBlock) ReadData() *[4096]byte {
+	return &b.Data
+}
+
+// Flush는 특정 슬롯을 본위치에 즉시 write한다. journal에 묶여 있으면 에러.
+func (c *BlockCache) Flush(b *CachedBlock) error {
+	if b.JournalLocked {
+		return EJOURNALLOCKED
+	}
+	err := c.Device.Write(b.BlockNum, &b.Data)
+	if err != nil {
+		return err
+	}
+	b.Dirty = false
+	return nil
+}
+
+// FlushAll은 dirty이고 evict 가능한 모든 슬롯을 본위치에 write한다.
+func (c *BlockCache) FlushAll() error {
+	cur := c.LRUTail
+	for cur != nil {
+		if cur.Dirty && cur.RefCount == 0 && !cur.JournalLocked {
+			// dirty and evictable cached block
+			c.Flush(cur)
+		}
+		cur = cur.prev
+	}
+
+	return nil
+}
+
+// Sync는 디바이스 fsync 호출.
+func (c *BlockCache) Sync() error {
+	err := c.Device.Sync()
+	if err != nil {
+		fmt.Printf("BlockCache: Failed to Sync()\n")
+		return err
+	}
+	// Mark clean for all the dirty data
+	cur := c.LRUHead
+	for cur != nil {
+		cur.Dirty = false // just mark clean
+		cur = cur.next
+	}
+	return nil
+}
+
+// JournalLock/Unlock은 journal subsystem이 호출. commit 진행 중인 블록을 본위치 flush에서 제외한다.
+func (c *BlockCache) JournalLock(b *CachedBlock) {
+	b.JournalLocked = true
+}
+func (c *BlockCache) JournalUnlock(b *CachedBlock) {
+	b.JournalLocked = false
+}
+
+func (c *BlockCache) FreezeForCommit(b *CachedBlock) {
+	if b.FrozenData != nil {
+		fmt.Printf("Double freeze happened on block %d\n", b.BlockNum)
+	}
+	frozen := b.Data
+	b.FrozenData = &frozen
+}
+
+func (c *BlockCache) ReleaseFrozen(b *CachedBlock) {
+	b.FrozenData = nil
+}
 
 type CachedBlock struct {
 	BlockNum uint64
@@ -31,8 +232,48 @@ type BlockCache struct {
 	Device   *BlockDevice
 }
 
+func (d *BlockDevice) Read(blockNum uint64) (*[4096]byte, error) {
+	//var buf [4096]byte
+	var buf [4096]byte
+	offset := int64(blockNum * uint64(d.BlockSize))
+	_, err := d.File.ReadAt(buf[:], offset)
+	if err != nil && err.Error() != "EOF" {
+		return &buf, err
+	}
+
+	return &buf, nil
+}
+func (d *BlockDevice) Write(blockNum uint64, data *[4096]byte) error {
+	offset := int64(blockNum * uint64(d.BlockSize))
+	_, err := d.File.WriteAt((*data)[:], offset) // O_DIRECT 인 것으로 가정
+	if err != nil {
+		fmt.Printf("Err - BlockDevice: %s", err)
+		return err
+	}
+	return nil
+}
+func (d *BlockDevice) Sync() error {
+	return d.File.Sync()
+}
+
 type BlockDevice struct {
 	File      *os.File // Disk Image File handle
 	BlockSize int      // fixed at 4096
 	NumBlocks uint64   // the total number of blocks in disk image
+}
+
+type IOMode int
+
+const (
+	IOCached IOMode = iota
+	IODirect
+)
+
+func (e IOMode) Error() string {
+	return "IOMode"
+}
+
+func (d *BlockDevice) ReadMode(blockNum uint64, mode IOMode) ([4096]byte, error) {
+	// future feature
+	return [4096]byte{}, nil
 }
