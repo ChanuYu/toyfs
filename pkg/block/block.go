@@ -282,6 +282,13 @@ func OpenDevice(path string, numBlocks uint64, blockSize int) (*BlockDevice, err
 // NewDevice wraps an already-open file (or test mock) as a BlockDevice without
 // resizing it. Use this when the caller manages the file lifecycle itself.
 func NewDevice(f *os.File, numBlocks uint64, blockSize int) *BlockDevice {
+	// zero-fill the image file and then return the BlockDevice
+	zeroBytes := make([]byte, numBlocks*uint64(blockSize))
+	var written uint64
+	for written < numBlocks*uint64(blockSize) {
+		nw, _ := f.Write(zeroBytes)
+		written += uint64(nw)
+	}
 	return &BlockDevice{File: f, BlockSize: blockSize, NumBlocks: numBlocks}
 }
 
