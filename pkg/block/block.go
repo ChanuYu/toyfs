@@ -262,6 +262,34 @@ type BlockDevice struct {
 	NumBlocks uint64   // the total number of blocks in disk image
 }
 
+// OpenDevice opens (creating if needed) the image at path and sizes it to
+// numBlocks * blockSize, returning a BlockDevice ready for mkfs/mount. The
+// caller owns the returned device and must Close it.
+func OpenDevice(path string, numBlocks uint64, blockSize int) (*BlockDevice, error) {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = f.Truncate(int64(numBlocks) * int64(blockSize)); err != nil {
+		f.Close()
+		return nil, err
+	}
+
+	return NewDevice(f, numBlocks, blockSize), nil
+}
+
+// NewDevice wraps an already-open file (or test mock) as a BlockDevice without
+// resizing it. Use this when the caller manages the file lifecycle itself.
+func NewDevice(f *os.File, numBlocks uint64, blockSize int) *BlockDevice {
+	return &BlockDevice{File: f, BlockSize: blockSize, NumBlocks: numBlocks}
+}
+
+// Close closes the underlying image file.
+func (d *BlockDevice) Close() error {
+	return d.File.Close()
+}
+
 type IOMode int
 
 const (
