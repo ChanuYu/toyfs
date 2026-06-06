@@ -33,3 +33,5 @@ disk.img
 testdata/*.img
 
 CLAUDE.md
+
+**/.DS_Store
