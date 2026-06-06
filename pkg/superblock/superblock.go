@@ -21,71 +21,17 @@ const (
 	// checksumOffset is the byte offset of the 8-byte integrity region
 	// (checkSum + reservedCsumPad). The CRC is computed with these 8 bytes
 	// zeroed
-	checksumOffset = 32 + 64 + 64 + 32 + 16 + 16 + 64 // = 288
+	ChecksumOffset = 32 + 64 + 64 + 32 + 16 + 16 + 64 // = 288
 
-	magicStr = "TOYF"
-	version1 = 1
+	MagicStr = "TOYF"
+	Version1 = 1
 )
 
 // SnapshotSlot is one entry in the superblock's snapshot slot table (16 B).
 type SnapshotSlot struct {
-	snapshotID uint32 // 0 = empty slot
-	flags      uint32
-	createdAt  uint64
-}
-
-type Superblock struct {
-	// identification (32 B)
-	magic     [4]uint8
-	version   uint32
-	blockSize uint32
-	flags     uint32
-	uuid      [16]uint8
-
-	// geometry (64 B)
-	totalBlocks       uint64
-	inodeCount        uint64
-	blockBitmapStart  uint64
-	blockBitmapBlocks uint64
-	inodeBitmapStart  uint64
-	inodeBitmapBlocks uint64
-	inodeTableStart   uint64
-	inodeTableBlocks  uint64
-
-	// subsystem regions (64 B)
-	journalStart        uint64
-	journalBlocks       uint64
-	snapshotMetaStart   uint64
-	snapshotMetaBlocks  uint64
-	refcountTableStart  uint64
-	refcountTableBlocks uint64
-	dataBlockStart      uint64
-	dataBlockCount      uint64
-
-	// runtime counters (32 B)
-	freeBlocks uint64
-	freeInodes uint64
-	nextTxnId  uint64 // journal transaction id
-	mountCount uint64 // cumulative count of the filesystem being mounted
-
-	// root & snapshot pointer (16 B)
-	rootInode        uint32 // reserved on 1
-	activeSnapshotId uint32 // 0 = active
-	reservedRootPad  uint64
-
-	// timestamps (16 B)
-	mkfsTime      uint64
-	lastMountTime uint64
-
-	// snapshot slot table (4 slots x 16 B = 64 B)
-	snapshots [4]SnapshotSlot
-
-	// integrity (8 B)
-	checkSum        uint32 // CRC32 of all preceding bytes (exclue these bytes)
-	reservedCsumPad uint32
-
-	// padding to 4096 B
-	pad [3800]uint8
+	SnapshotID uint32 // 0 = empty slot
+	Flags      uint32
+	CreatedAt  uint64
 }
 
 type TOYFS_SB_FLAG uint32
@@ -98,70 +44,73 @@ const (
 	TOYFS_SB_ROLLBACK_IN_PROGRESS = 1 << 4 // rolback이 여러 trx 에 걸쳐서 진행 중
 )
 
-// IMSuperblock is the in-memory representation of the superblock
+// Superblock is the in-memory representation of the superblock.
 //
-// It is a strict SUPERSET of the on-disk Superblock:
-//   - every on-disk field is carried here (so the fs ops layer never has to
-//     re-read block 1 to consult geometry, region offsets, or counters);
-//   - the on-disk padding (pad[3800], reservedCsumPad) is dropped — dead bytes
-//     have no reason to live in RAM;
-//   - runtime-only fields are added below. None of them are serialized.
-type IMSuperblock struct {
-	// ---- on-disk fields (1:1 with Superblock) ----
-	magic     [4]byte
-	version   uint32
-	blockSize uint32
-	flags     uint32
-	uuid      [16]byte
+// The on-disk byte layout is not modeled as a separate Go struct:
+// Marshal/Unmarshal convert directly between this type and a 4096-byte block
+type Superblock struct {
+	// ---- on-disk fields ----
+	// identification (32 B)
+	Magic     [4]byte
+	Version   uint32
+	BlockSize uint32
+	Flags     uint32
+	UUID      [16]byte
 
-	totalBlocks       uint64
-	inodeCount        uint64
-	blockBitmapStart  uint64
-	blockBitmapBlocks uint64
-	inodeBitmapStart  uint64
-	inodeBitmapBlocks uint64
-	inodeTableStart   uint64
-	inodeTableBlocks  uint64
+	// geometry (64 B)
+	TotalBlocks       uint64
+	InodeCount        uint64
+	BlockBitmapStart  uint64
+	BlockBitmapBlocks uint64
+	InodeBitmapStart  uint64
+	InodeBitmapBlocks uint64
+	InodeTableStart   uint64
+	InodeTableBlocks  uint64
 
-	journalStart        uint64
-	journalBlocks       uint64
-	snapshotMetaStart   uint64
-	snapshotMetaBlocks  uint64
-	refcountTableStart  uint64
-	refcountTableBlocks uint64
-	dataBlockStart      uint64
-	dataBlockCount      uint64
+	// subsystem regions (64 B)
+	JournalStart        uint64
+	JournalBlocks       uint64
+	SnapshotMetaStart   uint64
+	SnapshotMetaBlocks  uint64
+	RefcountTableStart  uint64
+	RefcountTableBlocks uint64
+	DataBlockStart      uint64
+	DataBlockCount      uint64
 
-	freeBlocks uint64
-	freeInodes uint64
-	nextTxnID  uint64
-	mountCount uint64
+	// runtime counters (32 B)
+	FreeBlocks uint64
+	FreeInodes uint64
+	NextTxnID  uint64 // journal transaction id
+	MountCount uint64 // cumulative count of the filesystem being mounted
 
-	rootInode        uint32
-	activeSnapshotID uint32
+	// root & snapshot pointer (16 B)
+	RootInode        uint32 // reserved on 1
+	ActiveSnapshotID uint32 // 0 = active
 
-	mkfsTime      uint64
-	lastMountTime uint64
+	// timestamps (16 B)
+	MkfsTime      uint64
+	LastMountTime uint64
 
-	snapshots [4]SnapshotSlot
+	// snapshot slot table (4 slots x 16 B = 64 B)
+	Snapshots [4]SnapshotSlot
 
-	// checkSum holds the value read at Unmarshal time. It is NOT live state:
+	// CheckSum holds the value read at Unmarshal time. It is NOT live state:
 	// the moment any field above is mutated it is stale, so it is recomputed
 	// in Marshal and validated in Verify — never trusted mid-session
-	checkSum uint32
+	CheckSum uint32
 
 	// ---- in-memory only (never serialized) ----
 
-	// dirty marks that this copy has diverged from disk and a Sync is owed.
+	// Dirty marks that this copy has diverged from disk and a Sync is owed.
 	// Persisting it would be meaningless: once flushed it is clean by
 	// definition.
-	dirty bool
+	Dirty bool
 
-	// diskOffset is the primary superblock block number (PrimaryBlock = 1).
-	diskOffset uint64
+	// DiskOffset is the primary superblock block number (PrimaryBlock = 1).
+	DiskOffset uint64
 
-	// backupOffset is total_blocks-1; both copies are written on Sync/mkfs.
-	backupOffset uint64
+	// BackupOffset is total_blocks-1; both copies are written on Sync/mkfs.
+	BackupOffset uint64
 
 	// cache is the back-reference used to write the superblock back through
 	// the block cache (see docs/01-disk-layout.md §6 dependency stack). This
@@ -169,7 +118,7 @@ type IMSuperblock struct {
 	cache *block.BlockCache
 }
 
-func (sb *IMSuperblock) marshal() [BlockSizeBytes]byte {
+func (sb *Superblock) Marshal() [BlockSizeBytes]byte {
 	var b [BlockSizeBytes]byte
 	le := binary.LittleEndian
 	o := 0
@@ -185,142 +134,142 @@ func (sb *IMSuperblock) marshal() [BlockSizeBytes]byte {
 	}
 
 	// identification (32 B)
-	copy(b[o:o+4], sb.magic[:])
+	copy(b[o:o+4], sb.Magic[:])
 	o += 4
-	put(uint64(sb.version), 4)
-	put(uint64(sb.blockSize), 4)
-	put(uint64(sb.flags), 4)
-	copy(b[o:o+16], sb.uuid[:])
+	put(uint64(sb.Version), 4)
+	put(uint64(sb.BlockSize), 4)
+	put(uint64(sb.Flags), 4)
+	copy(b[o:o+16], sb.UUID[:])
 	o += 16
 
 	// geometry (64 B)
-	put(sb.totalBlocks, 8)
-	put(sb.inodeCount, 8)
-	put(sb.blockBitmapStart, 8)
-	put(sb.blockBitmapBlocks, 8)
-	put(sb.inodeBitmapStart, 8)
-	put(sb.inodeBitmapBlocks, 8)
-	put(sb.inodeTableStart, 8)
-	put(sb.inodeTableBlocks, 8)
+	put(sb.TotalBlocks, 8)
+	put(sb.InodeCount, 8)
+	put(sb.BlockBitmapStart, 8)
+	put(sb.BlockBitmapBlocks, 8)
+	put(sb.InodeBitmapStart, 8)
+	put(sb.InodeBitmapBlocks, 8)
+	put(sb.InodeTableStart, 8)
+	put(sb.InodeTableBlocks, 8)
 
 	// subsystem regions (64 B)
-	put(sb.journalStart, 8)
-	put(sb.journalBlocks, 8)
-	put(sb.snapshotMetaStart, 8)
-	put(sb.snapshotMetaBlocks, 8)
-	put(sb.refcountTableStart, 8)
-	put(sb.refcountTableBlocks, 8)
-	put(sb.dataBlockStart, 8)
-	put(sb.dataBlockCount, 8)
+	put(sb.JournalStart, 8)
+	put(sb.JournalBlocks, 8)
+	put(sb.SnapshotMetaStart, 8)
+	put(sb.SnapshotMetaBlocks, 8)
+	put(sb.RefcountTableStart, 8)
+	put(sb.RefcountTableBlocks, 8)
+	put(sb.DataBlockStart, 8)
+	put(sb.DataBlockCount, 8)
 
 	// runtime counters (32 B)
-	put(sb.freeBlocks, 8)
-	put(sb.freeInodes, 8)
-	put(sb.nextTxnID, 8)
-	put(sb.mountCount, 8)
+	put(sb.FreeBlocks, 8)
+	put(sb.FreeInodes, 8)
+	put(sb.NextTxnID, 8)
+	put(sb.MountCount, 8)
 
 	// root & snapshot pointer (16 B)
-	put(uint64(sb.rootInode), 4)
-	put(uint64(sb.activeSnapshotID), 4)
+	put(uint64(sb.RootInode), 4)
+	put(uint64(sb.ActiveSnapshotID), 4)
 	put(0, 8) // reservedRootPad
 
 	// timestamps (16 B)
-	put(sb.mkfsTime, 8)
-	put(sb.lastMountTime, 8)
+	put(sb.MkfsTime, 8)
+	put(sb.LastMountTime, 8)
 
 	// snapshot slot table (64 B)
-	for _, s := range sb.snapshots {
-		put(uint64(s.snapshotID), 4)
-		put(uint64(s.flags), 4)
-		put(s.createdAt, 8)
+	for _, s := range sb.Snapshots {
+		put(uint64(s.SnapshotID), 4)
+		put(uint64(s.Flags), 4)
+		put(s.CreatedAt, 8)
 	}
 
 	sum := crc32.ChecksumIEEE(b[:])
-	le.PutUint32(b[checksumOffset:], sum)
-	sb.checkSum = sum
+	le.PutUint32(b[ChecksumOffset:], sum)
+	sb.CheckSum = sum
 
 	return b
 }
 
-func (sb *IMSuperblock) unmarshal(b *[BlockSizeBytes]byte) {
+func (sb *Superblock) Unmarshal(b *[BlockSizeBytes]byte) {
 	le := binary.LittleEndian
 	o := 0
 
 	getU32 := func() uint32 { v := le.Uint32(b[o:]); o += 4; return v }
 	getU64 := func() uint64 { v := le.Uint64(b[o:]); o += 8; return v }
 
-	copy(sb.magic[:], b[o:o+4])
+	copy(sb.Magic[:], b[o:o+4])
 	o += 4
-	sb.version = getU32()
-	sb.blockSize = getU32()
-	sb.flags = getU32()
-	copy(sb.uuid[:], b[o:o+16])
+	sb.Version = getU32()
+	sb.BlockSize = getU32()
+	sb.Flags = getU32()
+	copy(sb.UUID[:], b[o:o+16])
 	o += 16
 
-	sb.totalBlocks = getU64()
-	sb.inodeCount = getU64()
-	sb.blockBitmapStart = getU64()
-	sb.blockBitmapBlocks = getU64()
-	sb.inodeBitmapStart = getU64()
-	sb.inodeBitmapBlocks = getU64()
-	sb.inodeTableStart = getU64()
-	sb.inodeTableBlocks = getU64()
+	sb.TotalBlocks = getU64()
+	sb.InodeCount = getU64()
+	sb.BlockBitmapStart = getU64()
+	sb.BlockBitmapBlocks = getU64()
+	sb.InodeBitmapStart = getU64()
+	sb.InodeBitmapBlocks = getU64()
+	sb.InodeTableStart = getU64()
+	sb.InodeTableBlocks = getU64()
 
-	sb.journalStart = getU64()
-	sb.journalBlocks = getU64()
-	sb.snapshotMetaStart = getU64()
-	sb.snapshotMetaBlocks = getU64()
-	sb.refcountTableStart = getU64()
-	sb.refcountTableBlocks = getU64()
-	sb.dataBlockStart = getU64()
-	sb.dataBlockCount = getU64()
+	sb.JournalStart = getU64()
+	sb.JournalBlocks = getU64()
+	sb.SnapshotMetaStart = getU64()
+	sb.SnapshotMetaBlocks = getU64()
+	sb.RefcountTableStart = getU64()
+	sb.RefcountTableBlocks = getU64()
+	sb.DataBlockStart = getU64()
+	sb.DataBlockCount = getU64()
 
-	sb.freeBlocks = getU64()
-	sb.freeInodes = getU64()
-	sb.nextTxnID = getU64()
-	sb.mountCount = getU64()
+	sb.FreeBlocks = getU64()
+	sb.FreeInodes = getU64()
+	sb.NextTxnID = getU64()
+	sb.MountCount = getU64()
 
-	sb.rootInode = getU32()
-	sb.activeSnapshotID = getU32()
+	sb.RootInode = getU32()
+	sb.ActiveSnapshotID = getU32()
 	_ = getU64() // reservedRootPad
 
-	sb.mkfsTime = getU64()
-	sb.lastMountTime = getU64()
+	sb.MkfsTime = getU64()
+	sb.LastMountTime = getU64()
 
-	for i := range sb.snapshots {
-		sb.snapshots[i].snapshotID = getU32()
-		sb.snapshots[i].flags = getU32()
-		sb.snapshots[i].createdAt = getU64()
+	for i := range sb.Snapshots {
+		sb.Snapshots[i].SnapshotID = getU32()
+		sb.Snapshots[i].Flags = getU32()
+		sb.Snapshots[i].CreatedAt = getU64()
 	}
 
-	sb.checkSum = le.Uint32(b[checksumOffset:])
+	sb.CheckSum = le.Uint32(b[ChecksumOffset:])
 
-	sb.dirty = false
-	sb.diskOffset = PrimaryBlock
-	if sb.totalBlocks > 0 {
-		sb.backupOffset = sb.totalBlocks - 1
+	sb.Dirty = false
+	sb.DiskOffset = PrimaryBlock
+	if sb.TotalBlocks > 0 {
+		sb.BackupOffset = sb.TotalBlocks - 1
 	}
 }
 
-func verify(b *[BlockSizeBytes]byte) error {
+func Verify(b *[BlockSizeBytes]byte) error {
 	le := binary.LittleEndian
 
 	// magic number comparison
-	if string(b[0:4]) != magicStr {
+	if string(b[0:4]) != MagicStr {
 		return fmt.Errorf("superblock: bad magic %q\n", b[0:4])
 	}
 
 	// version comparison
-	if got := le.Uint32(b[4:]); got != version1 {
+	if got := le.Uint32(b[4:]); got != Version1 {
 		return fmt.Errorf("superblock: bad version %d\n", got)
 	}
 
 	// validate checksum
-	stored := le.Uint32(b[checksumOffset:])
+	stored := le.Uint32(b[ChecksumOffset:])
 	var tmp [BlockSizeBytes]byte
 	copy(tmp[:], b[:])
-	le.PutUint32(tmp[checksumOffset:], 0)
-	le.PutUint32(tmp[checksumOffset+4:], 0)
+	le.PutUint32(tmp[ChecksumOffset:], 0)
+	le.PutUint32(tmp[ChecksumOffset+4:], 0)
 
 	if got := crc32.ChecksumIEEE(tmp[:]); got != stored {
 		return fmt.Errorf("superblock: bad checksum (stored: %#x, computed: %#x)\n", stored, got)
@@ -369,10 +318,10 @@ func mkfs(path string) (*IMSuperblock, error) {
 	return nil, nil
 }
 
-func mount(sb *IMSuperblock, path string) error {
+func Mount(sb *Superblock, path string) error {
 	return nil
 }
 
-func unmount(sb *IMSuperblock) error {
+func Unmount(sb *Superblock) error {
 	return nil
 }
