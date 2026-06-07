@@ -1,10 +1,11 @@
 package superblock
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
-	"os"
+	"time"
 
 	"github.com/ChanuYu/toyfs/pkg/block"
 )
@@ -17,6 +18,14 @@ const (
 	// PrimaryBlock is the fixed location of the primary superblock
 	// The backup lives at total_blocks-1.
 	PrimaryBlock = 1
+
+	InodeBlockSize = 256
+
+	// header 1 + block bitmap 1 + inode bitmap 1 + inode table 256
+	SnapshotMetaBlocksPerSlot = 1 + 1 + 1 + 256 // 259
+	SnaptshotMetaSlots        = 4
+
+	RefcountTableBlocks = 8
 
 	// checksumOffset is the byte offset of the 8-byte integrity region
 	// (checkSum + reservedCsumPad). The CRC is computed with these 8 bytes
@@ -278,44 +287,110 @@ func Verify(b *[BlockSizeBytes]byte) error {
 	return nil
 }
 
-func mkfs(path string) (*IMSuperblock, error) {
+type ToyfsOps struct {
+	NumInode      uint64
+	JournalSizeMB uint64 // default: 1
+}
 
-	// make device image and BlockDevice
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+func (sb *Superblock) BitmapSet(bitmap string, offset uint64) {
+	// inode / data block 구분
+	var targetStart uint64
+	switch bitmap {
+	case "inode":
+		targetStart = sb.InodeBitmapStart
+	case "data":
+		targetStart = sb.BlockBitmapStart
+	}
+
+	// 오프셋으로 타겟 블록 계산 및 읽기
+	bc, err := sb.cache.Device.Read(targetStart)
 	if err != nil {
-		return nil, err
+		fmt.Printf("BitmapSet: Could not get %s bitmap block\n", bitmap)
+		return
 	}
 
-	if err = f.Truncate(BlockSizeBytes * BlockCounts); err != nil {
-		f.Close()
-		return nil, err
+	// 0번 inode x, root inode 1부터 시작
+	nBytes := (offset - 1) / 8
+	innerOffset := (offset - 1) % 8
+	mask := byte(1 << innerOffset)
+	if (*bc)[nBytes]&mask != 0 {
+		fmt.Printf("BitmapSet: %s Block %d is already set\n", bitmap, offset)
+		return
+	}
+	(*bc)[nBytes] |= 1 << innerOffset // byte sequence 내에서 오프셋 계산해서 set
+
+	sb.cache.Device.Write(targetStart, bc)
+}
+
+// Mkfs formats dev as a fresh toyfs filesystem and returns the resulting
+// in-memory superblock. The caller owns dev's lifecycle: it opens/sizes the
+// image (or supplies an in-memory mock) before calling, and fsyncs/closes
+// after. Mkfs writes directly through dev (no block cache) since it is a
+// one-shot format.
+func Mkfs(dev *block.BlockDevice, toyfsOps *ToyfsOps) (*Superblock, error) {
+	// §6.1.2 — compute geometry (all *Start / *Blocks) from dev.NumBlocks.
+	// See docs/01-disk-layout.md §4 / §7 for the size-derivation rules.
+	// TODO: derive blockBitmap, inodeBitmap, inodeTable, journal,
+	//       snapshotMeta, refcountTable, dataBlock regions.
+	sb := &Superblock{}
+	copy(sb.Magic[:], MagicStr)
+	sb.Version = Version1
+	sb.BlockSize = BlockSizeBytes
+	sb.Flags = TOYFS_SB_CLEAN | TOYFS_SB_HAS_JOURNAL // §6.1.8
+
+	// Make random bytes and fill UUID with it
+	rand.Read(sb.UUID[:])
+	// TODO: sb.TotalBlocks / region fields / counters / RootInode = 1 / timestamps
+	sb.TotalBlocks = BlockCounts
+	sb.InodeCount = toyfsOps.NumInode
+	sb.BlockBitmapStart = PrimaryBlock + 1
+	sb.BlockBitmapBlocks = 1
+	sb.InodeBitmapStart = sb.BlockBitmapStart + sb.BlockBitmapBlocks
+	sb.InodeBitmapBlocks = 1
+	sb.InodeTableStart = sb.InodeBitmapStart + sb.InodeBitmapBlocks
+	sb.InodeTableBlocks = sb.InodeCount / (BlockSizeBytes / InodeBlockSize)
+
+	sb.JournalStart = sb.InodeTableStart + sb.InodeTableBlocks
+	sb.JournalBlocks = toyfsOps.JournalSizeMB * (1024 * 1024) / BlockSizeBytes
+	sb.SnapshotMetaStart = sb.JournalStart + sb.JournalBlocks
+	sb.SnapshotMetaBlocks = SnapshotMetaBlocksPerSlot * SnaptshotMetaSlots
+	sb.RefcountTableStart = sb.SnapshotMetaStart + sb.SnapshotMetaBlocks
+	sb.RefcountTableBlocks = RefcountTableBlocks
+	sb.DataBlockStart = sb.RefcountTableStart + sb.RefcountTableBlocks
+	sb.DataBlockCount = sb.TotalBlocks - (1 + sb.BlockBitmapBlocks + sb.InodeBitmapBlocks + sb.InodeTableBlocks +
+		sb.JournalBlocks + sb.SnapshotMetaBlocks + sb.RefcountTableBlocks)
+
+	sb.FreeBlocks = sb.DataBlockCount
+	sb.FreeInodes = sb.InodeTableBlocks - 1 // reserved for root inode
+
+	sb.RootInode = 1 // reserved value
+	sb.MkfsTime = uint64(time.Now().Unix())
+
+	// §6.1.3 — initialize each region (bitmaps, inode table, refcount table).
+	// Per docs/01-disk-layout.md §3.3, only data blocks are bitmap-tracked.
+
+	// §6.1.4 — create root inode (#1) as a directory with "." / ".." dentries.
+	// TODO (depends on pkg/inode, pkg/dentry)
+	sb.BitmapSet("inode", 1) // set root inode
+
+	// §6.1.5 — initialize the journal superblock (first block of journal area).
+	// TODO (depends on pkg/journal)
+
+	// Marshal (computes CRC) and write to primary + backup.
+	blk := sb.Marshal()
+	if err := dev.Write(PrimaryBlock, &blk); err != nil {
+		return nil, fmt.Errorf("mkfs: write primary superblock: %w", err)
+	}
+	if err := dev.Write(sb.BackupOffset, &blk); err != nil {
+		return nil, fmt.Errorf("mkfs: write backup superblock: %w", err)
 	}
 
-	zeroFill := func(f *os.File, size int64) error {
-		zero := make([]byte, BlockSizeBytes)
-		var written int64
-		for written < size {
-			_, err := f.WriteAt(zero, written)
-			if err != nil {
-				return err
-			}
-			written += BlockSizeBytes
-		}
-
-		return f.Sync()
-	}
-	if err = zeroFill(f, BlockCounts*BlockSizeBytes); err != nil {
-		f.Close()
-		return nil, err
+	// fsync.
+	if err := dev.Sync(); err != nil {
+		return nil, fmt.Errorf("mkfs: sync: %w", err)
 	}
 
-	dev := &block.BlockDevice{
-		File:      f,
-		BlockSize: BlockSizeBytes,
-		NumBlocks: BlockCounts,
-	}
-
-	return nil, nil
+	return sb, nil
 }
 
 func Mount(sb *Superblock, path string) error {
